@@ -1,0 +1,8 @@
+{
+  "name": "U-Flash Prototype",
+  "description": "Underwater optical communication system using smartphone flashlight and camera with rolling-shutter decoding.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
