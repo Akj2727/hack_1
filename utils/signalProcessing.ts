@@ -179,24 +179,34 @@ export const decodeScanline = (binarizedLine: number[]): { char: string | null, 
   runs.push({ val: currentVal, len: currentLen });
 
   // 2. Clock Recovery (Estimate Bit Width)
-  // We ignore very short runs (noise) and find the median of the smaller runs
-  // to represent a single "bit" width.
-  const validRuns = runs.filter(r => r.len > 2); // Filter tiny noise specs
-  if (validRuns.length < 5) return { char: null, bits: "" }; // Not enough data
+  // We ignore only the tiniest runs (likely single‑pixel noise) and keep the rest.
+  // This makes the decoder more tolerant to fast rolling‑shutter patterns.
+  const MIN_RUN_LENGTH = 1;
+  const validRuns = runs.filter(r => r.len > MIN_RUN_LENGTH);
+
+  if (validRuns.length < 3) {
+    // Not enough structure to reliably decode a character yet – still expose raw bits.
+    const rawBits = runs
+      .map(run => run.val.toString().repeat(Math.max(1, run.len)))
+      .join("");
+    return { char: null, bits: rawBits };
+  }
 
   // Sort by length to find the "short" pulse width (1 bit) vs "long" pulse width (2+ bits)
   const sortedLengths = validRuns.map(r => r.len).sort((a, b) => a - b);
   
   // Heuristic: The lower quartile usually represents single-bit widths in a noisy signal
-  const bitWidth = sortedLengths[Math.floor(sortedLengths.length * 0.25)];
-  
-  if (bitWidth < 2) return { char: null, bits: "" }; // Signal too compressed or garbage
+  const quartileIndex = Math.max(0, Math.floor(sortedLengths.length * 0.25));
+  let bitWidth = sortedLengths[quartileIndex];
+
+  // Clamp bit width into a sane range so we don't prematurely discard signals
+  if (bitWidth < 1) bitWidth = 1;
 
   // 3. Reconstruct Bit Stream
   let stream = "";
   for (const run of validRuns) {
     // How many bits is this run?
-    const numBits = Math.round(run.len / bitWidth);
+    const numBits = Math.max(1, Math.round(run.len / bitWidth));
     for (let k = 0; k < numBits; k++) {
       stream += run.val.toString();
     }
