@@ -63,13 +63,30 @@ export const detectROI = (
   // Sampling step to improve performance (process every 4th pixel)
   const step = 4; 
 
+  // Calculate average brightness for adaptive thresholding
+  let totalBrightnessSum = 0;
+  let pixelCount = 0;
+  for (let y = 0; y < height; y += step * 2) {
+    for (let x = 0; x < width; x += step * 2) {
+      const i = (y * width + x) * 4;
+      const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
+      totalBrightnessSum += brightness;
+      pixelCount++;
+    }
+  }
+  const avgBrightness = pixelCount > 0 ? totalBrightnessSum / pixelCount : 0;
+  
+  // Adaptive threshold: look for pixels significantly brighter than average
+  // Lower threshold (50) to catch dimmer light sources, but require at least 1.5x average
+  const threshold = Math.max(50, avgBrightness * 1.5);
+
   for (let y = 0; y < height; y += step) {
     for (let x = 0; x < width; x += step) {
       const i = (y * width + x) * 4;
       // Simple luminance
       const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
 
-      if (brightness > 100) { // Threshold to ignore dark water background
+      if (brightness > threshold) {
         const weight = Math.pow(brightness, 2); // Square weight to prioritize very bright spots
         sumX += x * weight;
         sumY += y * weight;
@@ -112,14 +129,19 @@ export const extractVerticalScanline = (
 
 /**
  * Adaptive Binarization with Automatic Threshold Learning
+ * Improved version with multiple threshold strategies
  */
 export const binarizeSignal = (signal: number[]): number[] => {
   const binary: number[] = [];
-  const windowSize = 20;
+  if (signal.length === 0) return binary;
+  
+  const windowSize = 15;
 
-  // 1. Analyze Signal Statistics (Min, Max, Range)
+  // 1. Analyze Signal Statistics (Min, Max, Range, Median)
   let min = 255;
   let max = 0;
+  const sorted = [...signal].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
   
   for (const val of signal) {
     if (val < min) min = val;
@@ -127,15 +149,19 @@ export const binarizeSignal = (signal: number[]): number[] => {
   }
   
   const range = max - min;
+  const mean = signal.reduce((a, b) => a + b, 0) / signal.length;
   
-  // 2. Noise Floor Check
-  // If the contrast (range) is too low, it's likely just sensor noise or flat background.
-  if (range < 30) { 
+  // 2. Noise Floor Check - more lenient threshold
+  if (range < 20) { 
      return new Array(signal.length).fill(0);
   }
 
-  // 3. Automatic Offset Calculation
-  const adaptiveOffset = range * 0.25;
+  // 3. Use multiple threshold strategies
+  // Strategy 1: Global threshold (median-based)
+  const globalThreshold = median;
+  
+  // Strategy 2: Adaptive local threshold
+  const adaptiveOffset = Math.max(range * 0.2, 15); // At least 15 units of contrast needed
 
   for (let i = 0; i < signal.length; i++) {
     // Calculate local average around i
@@ -147,10 +173,49 @@ export const binarizeSignal = (signal: number[]): number[] => {
     }
     const localAvg = sum / count;
     
-    // Adaptive threshold: Pixel > Local Average + Adaptive Offset
-    binary.push(signal[i] > localAvg + adaptiveOffset ? 1 : 0);
+    // Use the higher of: global threshold or local adaptive threshold
+    const threshold = Math.max(globalThreshold, localAvg + adaptiveOffset);
+    
+    // Binary decision: above threshold = 1, below = 0
+    binary.push(signal[i] > threshold ? 1 : 0);
   }
-  return binary;
+  
+  // 4. Post-processing: remove isolated noise pixels
+  const cleaned: number[] = [...binary];
+  for (let i = 1; i < cleaned.length - 1; i++) {
+    // If a pixel is different from both neighbors, it's likely noise
+    if (cleaned[i] !== cleaned[i-1] && cleaned[i] !== cleaned[i+1]) {
+      // Make it match the previous pixel (smoothing)
+      cleaned[i] = cleaned[i-1];
+    }
+  }
+  
+  return cleaned;
+};
+
+/**
+ * Fuzzy preamble matching - allows for some bit errors
+ */
+const fuzzyPreambleMatch = (stream: string, threshold: number = 0.75): number => {
+  const preambleLen = PREAMBLE.length;
+  if (stream.length < preambleLen) return -1;
+  
+  let bestMatch = -1;
+  let bestScore = 0;
+  
+  for (let i = 0; i <= stream.length - preambleLen; i++) {
+    let matches = 0;
+    for (let j = 0; j < preambleLen; j++) {
+      if (stream[i + j] === PREAMBLE[j]) matches++;
+    }
+    const score = matches / preambleLen;
+    if (score > bestScore && score >= threshold) {
+      bestScore = score;
+      bestMatch = i;
+    }
+  }
+  
+  return bestScore >= threshold ? bestMatch : -1;
 };
 
 /**
@@ -178,38 +243,75 @@ export const decodeScanline = (binarizedLine: number[]): { char: string | null, 
   }
   runs.push({ val: currentVal, len: currentLen });
 
-  // 2. Clock Recovery (Estimate Bit Width)
-  // We ignore very short runs (noise) and find the median of the smaller runs
-  // to represent a single "bit" width.
-  const validRuns = runs.filter(r => r.len > 2); // Filter tiny noise specs
-  if (validRuns.length < 5) return { char: null, bits: "" }; // Not enough data
+  // Filter out very short runs (noise)
+  const MIN_RUN_LENGTH = 2;
+  const validRuns = runs.filter(r => r.len >= MIN_RUN_LENGTH);
 
-  // Sort by length to find the "short" pulse width (1 bit) vs "long" pulse width (2+ bits)
+  if (validRuns.length < 3) {
+    // Not enough structure - return raw bits
+    const rawBits = runs
+      .map(run => run.val.toString().repeat(Math.max(1, Math.min(run.len, 10))))
+      .join("");
+    return { char: null, bits: rawBits };
+  }
+
+  // 2. Improved Clock Recovery - use median of run lengths
   const sortedLengths = validRuns.map(r => r.len).sort((a, b) => a - b);
+  const medianIndex = Math.floor(sortedLengths.length / 2);
+  let bitWidth = sortedLengths[medianIndex];
   
-  // Heuristic: The lower quartile usually represents single-bit widths in a noisy signal
-  const bitWidth = sortedLengths[Math.floor(sortedLengths.length * 0.25)];
+  // Alternative: use mode (most common length) if available
+  const lengthCounts: { [key: number]: number } = {};
+  validRuns.forEach(r => {
+    lengthCounts[r.len] = (lengthCounts[r.len] || 0) + 1;
+  });
+  let maxCount = 0;
+  let modeLength = bitWidth;
+  for (const [len, count] of Object.entries(lengthCounts)) {
+    if (count > maxCount) {
+      maxCount = count;
+      modeLength = parseInt(len);
+    }
+  }
   
-  if (bitWidth < 2) return { char: null, bits: "" }; // Signal too compressed or garbage
+  // Use mode if it's reasonable, otherwise fall back to median
+  if (maxCount >= 2 && modeLength >= 2 && modeLength <= 50) {
+    bitWidth = modeLength;
+  }
+  
+  // Clamp bit width to reasonable range
+  if (bitWidth < 2) bitWidth = 2;
+  if (bitWidth > 100) bitWidth = 100;
 
-  // 3. Reconstruct Bit Stream
+  // 3. Reconstruct Bit Stream with improved quantization
   let stream = "";
   for (const run of validRuns) {
-    // How many bits is this run?
-    const numBits = Math.round(run.len / bitWidth);
-    for (let k = 0; k < numBits; k++) {
+    // More accurate bit count calculation
+    const numBits = Math.max(1, Math.round(run.len / bitWidth));
+    // Limit expansion to prevent runaway streams
+    const clampedBits = Math.min(numBits, 10);
+    for (let k = 0; k < clampedBits; k++) {
       stream += run.val.toString();
     }
   }
 
-  // 4. Packet Search
-  // Look for the Preamble (11101011)
-  const preambleIndex = stream.indexOf(PREAMBLE);
+  // Limit stream length to prevent memory issues
+  if (stream.length > 200) {
+    stream = stream.substring(0, 200);
+  }
+
+  // 4. Packet Search with fuzzy matching
+  let preambleIndex = stream.indexOf(PREAMBLE);
+  
+  // If exact match fails, try fuzzy matching
+  if (preambleIndex === -1) {
+    preambleIndex = fuzzyPreambleMatch(stream, 0.7); // 70% match threshold
+  }
   
   if (preambleIndex !== -1) {
     // Extract payload after preamble
     const payloadStart = preambleIndex + PREAMBLE.length;
-    const payloadBits = stream.substr(payloadStart, 8); // Grab 1 Char
+    const payloadBits = stream.substring(payloadStart, payloadStart + 8);
 
     if (payloadBits.length === 8) {
       const char = binaryToText(payloadBits);
