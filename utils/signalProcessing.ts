@@ -63,13 +63,30 @@ export const detectROI = (
   // Sampling step to improve performance (process every 4th pixel)
   const step = 4; 
 
+  // Calculate average brightness for adaptive thresholding
+  let totalBrightnessSum = 0;
+  let pixelCount = 0;
+  for (let y = 0; y < height; y += step * 2) {
+    for (let x = 0; x < width; x += step * 2) {
+      const i = (y * width + x) * 4;
+      const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
+      totalBrightnessSum += brightness;
+      pixelCount++;
+    }
+  }
+  const avgBrightness = pixelCount > 0 ? totalBrightnessSum / pixelCount : 0;
+  
+  // Adaptive threshold: look for pixels significantly brighter than average
+  // Lower threshold (50) to catch dimmer light sources, but require at least 1.5x average
+  const threshold = Math.max(50, avgBrightness * 1.5);
+
   for (let y = 0; y < height; y += step) {
     for (let x = 0; x < width; x += step) {
       const i = (y * width + x) * 4;
       // Simple luminance
       const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
 
-      if (brightness > 100) { // Threshold to ignore dark water background
+      if (brightness > threshold) {
         const weight = Math.pow(brightness, 2); // Square weight to prioritize very bright spots
         sumX += x * weight;
         sumY += y * weight;
